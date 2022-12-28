@@ -1,7 +1,7 @@
 #!python
 # cython: language_level=3
 # distutils: language = c++
-# distutils: sources= ./whisper.cpp/whisper.cpp ./whisper.cpp/ggml.c
+# distutils: sources= ./whisper.cpp/ggml.c ./whisper.cpp/whisper.cpp
 
 import ffmpeg
 import numpy as np
@@ -9,9 +9,7 @@ import requests
 import os
 from pathlib import Path
 
-MODELS_DIR = str(Path('~/ggml-models').expanduser())
-print("Saving models to:", MODELS_DIR)
-
+DEFAULT_MODELS_DIR = str(Path('~/ggml-models').expanduser())
 
 cimport numpy as cnp
 
@@ -29,17 +27,17 @@ MODELS = {
     'ggml-large.bin': 'https://huggingface.co/datasets/ggerganov/whisper.cpp/resolve/main/ggml-large.bin',
 }
 
-def model_exists(model):
-    return os.path.exists(MODELS_DIR + "/" + model.decode())
+def model_exists(model_dir, model):
+    return os.path.exists(model_dir + "/" + model.decode())
 
-def download_model(model):
-    if model_exists(model):
+def download_model(model_dir, model):
+    print("Saving models to:", model_dir)
+    if model_exists(model_dir, model):
         return
-
     print(f'Downloading {model}...')
     url = MODELS[model.decode()]
     r = requests.get(url, allow_redirects=True)
-    with open(MODELS_DIR + "/" + model.decode(), 'wb') as f:
+    with open(model_dir + "/" + model.decode(), 'wb') as f:
         f.write(r.content)
 
 
@@ -80,6 +78,8 @@ cdef whisper_full_params default_params() nogil:
     params.print_realtime = True
     params.print_progress = True
     params.translate = False
+    params.print_timestamps = False
+    params.speed_up = False
     params.language = <const char *> LANGUAGE
     n_threads = N_THREADS
     return params
@@ -88,24 +88,36 @@ cdef whisper_full_params default_params() nogil:
 cdef class Whisper:
     cdef whisper_context * ctx
     cdef whisper_full_params params
+    cdef int proc_count
 
-    def __init__(self, model=DEFAULT_MODEL, pb=None):
+    def __init__(self, model=DEFAULT_MODEL, model_dir=DEFAULT_MODELS_DIR, pb=None):
         model_fullname = f'ggml-{model}.bin'.encode('utf8')
-        download_model(model_fullname)
-        cdef bytes model_b = MODELS_DIR.encode('utf8')  + b'/' + model_fullname
+        download_model(model_dir, model_fullname)
+        cdef bytes model_b = model_dir.encode('utf8')  + b'/' + model_fullname
         self.ctx = whisper_init(model_b)
         self.params = default_params()
+        self.proc_count = 1
         whisper_print_system_info()
 
     def __dealloc__(self):
         whisper_free(self.ctx)
 
+    def set_params(self, *, language=None, translate=None, proc_count: int =None):
+        if language:
+            self.params.language = language
+        if translate:
+            self.params.translate = True
+        elif translate is not None:
+            self.params.translate = False
+        if proc_count and proc_count > 0:
+           self.proc_count = proc_count
+
     def transcribe(self, filename=TEST_FILE):
         print("Loading data..")
         cdef audio_data data = load_audio(<bytes>filename)
         print("Transcribing..")
-        return whisper_full(self.ctx, self.params, data.frames, data.n_frames)
-    
+        return whisper_full_parallel(self.ctx, self.params, data.frames, data.n_frames, self.proc_count)
+
     def extract_text(self, int res):
         print("Extracting text...")
         if res != 0:
